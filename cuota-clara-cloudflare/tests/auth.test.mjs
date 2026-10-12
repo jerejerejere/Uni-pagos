@@ -1,0 +1,22 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {generateKeyPair,SignJWT} from 'jose';
+import {verifyAdminToken,authorizeOwnerIdentity,assertSameOrigin,setSessionCookies,clearSessionCookies,SessionError,readJSON} from '../lib/session.ts';
+const {publicKey,privateKey}=await generateKeyPair('RS256');
+const {privateKey:otherKey}=await generateKeyPair('RS256');
+const cfg={projectId:'test-club',apiKey:'test-public-key',adminUid:'owner-uid'};
+const resolver=async()=>publicKey;
+async function token(overrides={},key=privateKey){const now=Math.floor(Date.now()/1000);return new SignJWT({sub:'owner-uid',iss:'https://securetoken.google.com/test-club',aud:'test-club',iat:now-1,auth_time:now-2,exp:now+1800,...overrides}).setProtectedHeader({alg:'RS256',kid:'test-key'}).sign(key);}
+const denied=(status)=>error=>error instanceof SessionError&&error.status===status;
+test('accepts signed administrator token for this project',async()=>assert.equal((await verifyAdminToken(await token(),cfg,resolver)).sub,'owner-uid'));
+test('rejects another signed Firebase user',async()=>assert.rejects(verifyAdminToken(await token({sub:'other-user'}),cfg,resolver),denied(403)));
+test('rejects another project',async()=>assert.rejects(verifyAdminToken(await token({aud:'other-project'}),cfg,resolver),denied(401)));
+test('rejects wrong issuer',async()=>assert.rejects(verifyAdminToken(await token({iss:'https://attacker.example'}),cfg,resolver),denied(401)));
+test('rejects expired session',async()=>assert.rejects(verifyAdminToken(await token({exp:1}),cfg,resolver),denied(401)));
+test('rejects a forged signature',async()=>assert.rejects(verifyAdminToken(await token({},otherKey),cfg,resolver),denied(401)));
+test('rejects future authentication timestamps',async()=>assert.rejects(verifyAdminToken(await token({auth_time:9999999999}),cfg,resolver),denied(401)));
+test('configuration missing fails closed',async()=>assert.rejects(verifyAdminToken(await token(),{...cfg,adminUid:''},resolver),denied(503)));
+test('old ChatGPT identity headers never grant access',async()=>assert.rejects(authorizeOwnerIdentity(new Headers({'oai-authenticated-user-id':'owner-uid','oai-authenticated-user-email':'jere477@gmail.com'}),cfg,resolver),denied(401)));
+test('same-origin mutation allowed; cross-origin or missing origin rejected',()=>{const url='https://club.workers.dev/api/data';assert.doesNotThrow(()=>assertSameOrigin(new Request(url,{method:'POST',headers:{Origin:'https://club.workers.dev'}})));for(const origin of ['', 'https://other.example'])assert.throws(()=>assertSameOrigin(new Request(url,{method:'POST',headers:origin?{Origin:origin}:{}})),denied(403));});
+test('session and logout cookies are secure, HTTP-only and root scoped',()=>{const headers=new Headers();setSessionCookies(headers,'test-id','test-refresh',3600);for(const value of headers.getSetCookie()){assert.match(value,/Secure/);assert.match(value,/HttpOnly/);assert.match(value,/SameSite=Strict/);assert.match(value,/Path=\//);assert.match(value,/^__Host-/);}const cleared=new Headers();clearSessionCookies(cleared);assert.equal(cleared.getSetCookie().length,2);assert.ok(cleared.getSetCookie().every(value=>value.includes('Max-Age=0')));});
+test('oversized JSON rejected before application processing',async()=>assert.rejects(readJSON(new Request('https://club.workers.dev/api/data',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:'x'.repeat(17000)})})),denied(413)));
